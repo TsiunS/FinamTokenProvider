@@ -191,7 +191,11 @@ public class FinamBrowserTokenProvider
         await page.WaitForSelectorAsync("body");
 
         await AcceptCookiesAsync(page, debugLog);
-        await FillFormAsync(page, parameters, debugLog);
+        var formFilled = await FillFormAsync(page, parameters, debugLog);
+        if (!formFilled)
+        {
+            Console.WriteLine("ВНИМАНИЕ: Не удалось уверенно заполнить поля формы автоматически.");
+        }
 
         await page.ScreenshotAsync("finam-before-download-click.png");
         Console.WriteLine("Нажимаем кнопку 'Получить файл'...");
@@ -236,59 +240,36 @@ public class FinamBrowserTokenProvider
                     "Не удалось получить токен: Finam отвечает 401 на /sessions/token. " +
                     "Откройте браузер, авторизуйтесь на finam.ru (в том же профиле Chromium), затем повторите запуск.");
             }
-        }
-        catch (Exception ex)
-        {
-            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie accept skipped: {ex.Message}");
-        }
-    }
-
-    private static async Task FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
-    {
-        var fromDate = parameters.From.ToString("dd.MM.yyyy");
-        var toDate = parameters.To.ToString("dd.MM.yyyy");
-        var timeframeValue = GetTimeframeValue(parameters.Timeframe);
-
-        await page.WaitForSelectorAsync("input");
-
-        var formFilled = await page.EvaluateFunctionAsync<bool>(@"(fromDate, toDate, timeframeValue) => {
-            const allInputs = Array.from(document.querySelectorAll('input'));
-            const allSelects = Array.from(document.querySelectorAll('select'));
-
-            const fromInput = allInputs.find(i => {
-                const n = (i.name || '').toLowerCase();
-                const p = (i.placeholder || '').toLowerCase();
-                return n === 'from' || p.includes('дд.мм.гггг');
-            });
-
-            const toInput = allInputs.find(i => {
-                const n = (i.name || '').toLowerCase();
-                return n === 'to';
-            }) || allInputs.filter(i => (i.placeholder || '').toLowerCase().includes('дд.мм.гггг'))[1];
-
-            const periodSelect = allSelects.find(s => (s.name || '').toLowerCase() === 'p');
-
-            const writeValue = (el, value) => {
-                if (!el) return;
-                el.focus();
-                el.value = value;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.blur();
-            };
-
-            writeValue(fromInput, fromDate);
-            writeValue(toInput, toDate);
-
-            if (periodSelect) {
-                periodSelect.value = timeframeValue;
-                periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
-            }
 
             return !!fromInput || !!toInput || !!periodSelect;
         }", fromDate, toDate, timeframeValue);
 
         debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
+    }
+
+    private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
+    {
+        try
+        {
+            var accepted = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const controls = Array.from(document.querySelectorAll('button, div[role=""button""], a'));
+                const accept = controls.find(c => {
+                    const text = (c.textContent || '').toLowerCase();
+                    return text.includes('принять') || text.includes('соглас');
+                });
+                if (!accept) return false;
+                accept.click();
+                return true;
+            }");
+
+            if (accepted)
+            {
+                debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie banner accepted");
+                await Task.Delay(1000);
+            }
+        }
+
+        throw new InvalidOperationException("Неожиданное состояние: метод завершился без токена и без ошибки.");
     }
 
     private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
@@ -318,7 +299,7 @@ public class FinamBrowserTokenProvider
         }
     }
 
-    private static async Task FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
+    private static async Task<bool> FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
     {
         var fromDate = parameters.From.ToString("dd.MM.yyyy");
         var toDate = parameters.To.ToString("dd.MM.yyyy");
@@ -364,6 +345,8 @@ public class FinamBrowserTokenProvider
         }", fromDate, toDate, timeframeValue);
 
         debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
+
+        return formFilled;
     }
 
     private static string GetTimeframeValue(TimeFrame tf)
