@@ -8,20 +8,31 @@
             {
                 var provider = new FinamBrowserTokenProvider();
 
-                var token = await provider.GetTokenAsync(new FinamBrowserTokenProvider.DownloadParams
+                // Пример 1: Тики за один день
+                var token1 = await provider.GetTokenAsync(new FinamBrowserTokenProvider.DownloadParams
                 {
                     Symbol = "SBER",
-                    From = DateTime.UtcNow.AddDays(-7),
-                    To = DateTime.UtcNow,
-                    Timeframe = FinamBrowserTokenProvider.TimeFrame.Minutes30
+                    From = DateTime.Parse("2026-03-18"),
+                    To = DateTime.Parse("2026-03-18"),  // Одинаковые даты для тиков
+                    Timeframe = FinamBrowserTokenProvider.TimeFrame.Ticks
                 });
 
-                Console.WriteLine($"Готово. Токен: {token}");
+                // Пример 2: Часовые свечи за неделю
+                var token2 = await provider.GetTokenAsync(new FinamBrowserTokenProvider.DownloadParams
+                {
+                    Symbol = "SBER",
+                    From = DateTime.Now.AddDays(-7),
+                    To = DateTime.Now,
+                    Timeframe = FinamBrowserTokenProvider.TimeFrame.Hour1
+                });
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка: {ex}");
+                Console.WriteLine($"Ошибка: {ex.Message}");
             }
+
+            Console.WriteLine("Нажмите любую клавишу для выхода...");
+            Console.ReadKey();
         }
     }
 }
