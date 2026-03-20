@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 
 public class FinamBrowserTokenProvider
@@ -128,8 +127,6 @@ public class FinamBrowserTokenProvider
 
         AttachNetworkTracing(page, "main");
 
-        var popupCounter = 0;
-
         browser.TargetCreated += async (_, e) =>
         {
             try
@@ -139,8 +136,7 @@ public class FinamBrowserTokenProvider
                     var popup = await e.Target.PageAsync();
                     if (popup != null)
                     {
-                        var popupName = $"popup-{Interlocked.Increment(ref popupCounter)}";
-                        AttachNetworkTracing(popup, popupName);
+                        AttachNetworkTracing(popup, $"popup-{e.Target.TargetId}");
                     }
                 }
             }
