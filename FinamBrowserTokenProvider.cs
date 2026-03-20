@@ -236,9 +236,59 @@ public class FinamBrowserTokenProvider
                     "Не удалось получить токен: Finam отвечает 401 на /sessions/token. " +
                     "Откройте браузер, авторизуйтесь на finam.ru (в том же профиле Chromium), затем повторите запуск.");
             }
-
-            throw;
         }
+        catch (Exception ex)
+        {
+            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie accept skipped: {ex.Message}");
+        }
+    }
+
+    private static async Task FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
+    {
+        var fromDate = parameters.From.ToString("dd.MM.yyyy");
+        var toDate = parameters.To.ToString("dd.MM.yyyy");
+        var timeframeValue = GetTimeframeValue(parameters.Timeframe);
+
+        await page.WaitForSelectorAsync("input");
+
+        var formFilled = await page.EvaluateFunctionAsync<bool>(@"(fromDate, toDate, timeframeValue) => {
+            const allInputs = Array.from(document.querySelectorAll('input'));
+            const allSelects = Array.from(document.querySelectorAll('select'));
+
+            const fromInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                const p = (i.placeholder || '').toLowerCase();
+                return n === 'from' || p.includes('дд.мм.гггг');
+            });
+
+            const toInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                return n === 'to';
+            }) || allInputs.filter(i => (i.placeholder || '').toLowerCase().includes('дд.мм.гггг'))[1];
+
+            const periodSelect = allSelects.find(s => (s.name || '').toLowerCase() === 'p');
+
+            const writeValue = (el, value) => {
+                if (!el) return;
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            };
+
+            writeValue(fromInput, fromDate);
+            writeValue(toInput, toDate);
+
+            if (periodSelect) {
+                periodSelect.value = timeframeValue;
+                periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            return !!fromInput || !!toInput || !!periodSelect;
+        }", fromDate, toDate, timeframeValue);
+
+        debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
     }
 
     private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
