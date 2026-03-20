@@ -241,7 +241,32 @@ public class FinamBrowserTokenProvider
                     "Откройте браузер, авторизуйтесь на finam.ru (в том же профиле Chromium), затем повторите запуск.");
             }
 
-            throw;
+            return !!fromInput || !!toInput || !!periodSelect;
+        }", fromDate, toDate, timeframeValue);
+
+        debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
+    }
+
+    private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
+    {
+        try
+        {
+            var accepted = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const controls = Array.from(document.querySelectorAll('button, div[role=""button""], a'));
+                const accept = controls.find(c => {
+                    const text = (c.textContent || '').toLowerCase();
+                    return text.includes('принять') || text.includes('соглас');
+                });
+                if (!accept) return false;
+                accept.click();
+                return true;
+            }");
+
+            if (accepted)
+            {
+                debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie banner accepted");
+                await Task.Delay(1000);
+            }
         }
 
         throw new InvalidOperationException("Неожиданное состояние: метод завершился без токена и без ошибки.");
