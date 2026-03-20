@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -43,11 +44,15 @@ public class FinamBrowserTokenProvider
 
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         var debugLog = new List<string>();
+        var sessionTokenUnauthorized = false;
+
+        var profileDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FinamPuppeteerProfile");
 
         var launchOptions = new LaunchOptions
         {
             Headless = false,
             DefaultViewport = null,
+            UserDataDir = profileDir,
             Args = new[]
             {
                 "--disable-blink-features=AutomationControlled",
@@ -57,6 +62,8 @@ public class FinamBrowserTokenProvider
                 "--window-size=1920,1080"
             }
         };
+
+        Console.WriteLine($"Профиль Chromium: {profileDir}");
 
         using var browser = await Puppeteer.LaunchAsync(launchOptions);
         using var page = await browser.NewPageAsync();
@@ -118,6 +125,15 @@ public class FinamBrowserTokenProvider
                 }
 
                 TryExtractTokenFromUrl(e.Response.Url, $"response/{pageName}");
+
+                if (e.Response.Url.Contains("/sessions/token", StringComparison.OrdinalIgnoreCase)
+                    && e.Response.Status == HttpStatusCode.Unauthorized)
+                {
+                    sessionTokenUnauthorized = true;
+                    var authMsg = $"[{DateTime.Now:HH:mm:ss}] [{pageName}] sessions/token -> 401 (вероятно нет авторизации на Finam)";
+                    debugLog.Add(authMsg);
+                    Console.WriteLine(authMsg);
+                }
             };
 
             tracedPage.FrameNavigated += (_, e) =>
@@ -213,8 +229,66 @@ public class FinamBrowserTokenProvider
             await File.WriteAllLinesAsync("debug.log", debugLog);
             await File.WriteAllTextAsync("page.html", await page.GetContentAsync());
             await page.ScreenshotAsync("finam-timeout.png");
-            throw;
+
+            if (sessionTokenUnauthorized)
+            {
+                throw new InvalidOperationException(
+                    "Не удалось получить токен: Finam отвечает 401 на /sessions/token. " +
+                    "Откройте браузер, авторизуйтесь на finam.ru (в том же профиле Chromium), затем повторите запуск.");
+            }
         }
+        catch (Exception ex)
+        {
+            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie accept skipped: {ex.Message}");
+        }
+    }
+
+    private static async Task FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
+    {
+        var fromDate = parameters.From.ToString("dd.MM.yyyy");
+        var toDate = parameters.To.ToString("dd.MM.yyyy");
+        var timeframeValue = GetTimeframeValue(parameters.Timeframe);
+
+        await page.WaitForSelectorAsync("input");
+
+        var formFilled = await page.EvaluateFunctionAsync<bool>(@"(fromDate, toDate, timeframeValue) => {
+            const allInputs = Array.from(document.querySelectorAll('input'));
+            const allSelects = Array.from(document.querySelectorAll('select'));
+
+            const fromInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                const p = (i.placeholder || '').toLowerCase();
+                return n === 'from' || p.includes('дд.мм.гггг');
+            });
+
+            const toInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                return n === 'to';
+            }) || allInputs.filter(i => (i.placeholder || '').toLowerCase().includes('дд.мм.гггг'))[1];
+
+            const periodSelect = allSelects.find(s => (s.name || '').toLowerCase() === 'p');
+
+            const writeValue = (el, value) => {
+                if (!el) return;
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            };
+
+            writeValue(fromInput, fromDate);
+            writeValue(toInput, toDate);
+
+            if (periodSelect) {
+                periodSelect.value = timeframeValue;
+                periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            return !!fromInput || !!toInput || !!periodSelect;
+        }", fromDate, toDate, timeframeValue);
+
+        debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
     }
 
     private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
