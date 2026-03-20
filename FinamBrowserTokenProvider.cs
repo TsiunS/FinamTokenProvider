@@ -1,10 +1,11 @@
 ﻿using PuppeteerSharp;
 using System;
-using System.Threading.Tasks;
-using System.Text.Json;
-using System.Linq;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 public class FinamBrowserTokenProvider
 {
@@ -23,32 +24,37 @@ public class FinamBrowserTokenProvider
         public string Format { get; set; } = "txt";
     }
 
-    public async Task<string> GetTokenAsync(DownloadParams parameters = null)
+    public async Task<string> GetTokenAsync(DownloadParams? parameters = null)
     {
-        if (parameters == null)
+        parameters ??= new DownloadParams
         {
-            parameters = new DownloadParams
-            {
-                From = DateTime.Now.AddDays(-1),
-                To = DateTime.Now,
-                Timeframe = TimeFrame.Hour1
-            };
-        }
+            From = DateTime.UtcNow.AddDays(-1),
+            To = DateTime.UtcNow,
+            Timeframe = TimeFrame.Hour1
+        };
 
         if (parameters.Timeframe == TimeFrame.Ticks && parameters.From.Date != parameters.To.Date)
         {
-            Console.WriteLine("ВНИМАНИЕ: Для тиков даты должны совпадать! Устанавливаем одну дату.");
+            Console.WriteLine("ВНИМАНИЕ: Для тиков даты должны совпадать. Используем только дату From.");
             parameters.To = parameters.From;
         }
 
-        Console.WriteLine("Проверяем наличие браузера...");
+        Console.WriteLine("Скачиваем/проверяем Chromium для PuppeteerSharp...");
         await new BrowserFetcher().DownloadAsync();
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var debugLog = new List<string>();
+        var sessionTokenUnauthorized = false;
+
+        var profileDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FinamPuppeteerProfile");
 
         var launchOptions = new LaunchOptions
         {
             Headless = false,
             DefaultViewport = null,
-            Args = new[] {
+            UserDataDir = profileDir,
+            Args = new[]
+            {
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-web-security",
@@ -57,10 +63,10 @@ public class FinamBrowserTokenProvider
             }
         };
 
+        Console.WriteLine($"Профиль Chromium: {profileDir}");
+
         using var browser = await Puppeteer.LaunchAsync(launchOptions);
         using var page = await browser.NewPageAsync();
-
-        await page.SetViewportAsync(new ViewPortOptions { Width = 1920, Height = 1080 });
 
         page.DefaultTimeout = 120000;
         page.DefaultNavigationTimeout = 120000;
@@ -68,226 +74,257 @@ public class FinamBrowserTokenProvider
         await page.SetUserAgentAsync(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36");
 
-        // Перехватываем ВСЕ ответы для отладки
-        var tcs = new TaskCompletionSource<string>();
-        var debugLog = new List<string>();
+        void TryExtractTokenFromUrl(string? url, string source)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return;
+            }
 
-        page.Response += async (sender, e) =>
+            var decoded = Uri.UnescapeDataString(url);
+            var match = Regex.Match(decoded, @"[?&]finam_token=([^&]+)", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                return;
+            }
+
+            var token = match.Groups[1].Value;
+            var message = $"[{DateTime.Now:HH:mm:ss}] Токен найден в {source}: {url}";
+            Console.WriteLine(message);
+            debugLog.Add(message);
+            tcs.TrySetResult(token);
+        }
+
+        void AttachNetworkTracing(IPage tracedPage, string pageName)
+        {
+            tracedPage.Request += (_, e) =>
+            {
+                var line = $"[{DateTime.Now:HH:mm:ss}] [{pageName}] REQUEST {e.Request.Method} {e.Request.Url}";
+                debugLog.Add(line);
+
+                if (e.Request.Url.Contains("export", StringComparison.OrdinalIgnoreCase)
+                    || e.Request.Url.Contains("sessions/token", StringComparison.OrdinalIgnoreCase)
+                    || e.Request.Url.Contains(".out", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine(line);
+                }
+
+                TryExtractTokenFromUrl(e.Request.Url, $"request/{pageName}");
+            };
+
+            tracedPage.Response += (_, e) =>
+            {
+                var line = $"[{DateTime.Now:HH:mm:ss}] [{pageName}] RESPONSE {(int)e.Response.Status} {e.Response.Url}";
+                debugLog.Add(line);
+
+                if (e.Response.Url.Contains("export", StringComparison.OrdinalIgnoreCase)
+                    || e.Response.Url.Contains("sessions/token", StringComparison.OrdinalIgnoreCase)
+                    || e.Response.Url.Contains(".out", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine(line);
+                }
+
+                TryExtractTokenFromUrl(e.Response.Url, $"response/{pageName}");
+
+                if (e.Response.Url.Contains("/sessions/token", StringComparison.OrdinalIgnoreCase)
+                    && e.Response.Status == HttpStatusCode.Unauthorized)
+                {
+                    sessionTokenUnauthorized = true;
+                    var authMsg = $"[{DateTime.Now:HH:mm:ss}] [{pageName}] sessions/token -> 401 (вероятно нет авторизации на Finam)";
+                    debugLog.Add(authMsg);
+                    Console.WriteLine(authMsg);
+                }
+            };
+
+            tracedPage.FrameNavigated += (_, e) =>
+            {
+                TryExtractTokenFromUrl(e.Frame.Url, $"frame/{pageName}");
+            };
+        }
+
+        AttachNetworkTracing(page, "main");
+
+        var popupCounter = 0;
+
+        browser.TargetCreated += async (_, e) =>
         {
             try
             {
-                var url = e.Response.Url;
-                var status = e.Response.Status;
-                var logEntry = $"Статус: {status} URL: {url}";
-                Console.WriteLine(logEntry);
-                debugLog.Add($"{DateTime.Now:HH:mm:ss} - {logEntry}");
-
-                if (url.Contains("/sessions/token"))
+                if (e.Target.Type == TargetType.Page)
                 {
-                    if (status == System.Net.HttpStatusCode.OK)
+                    var popup = await e.Target.PageAsync();
+                    if (popup != null)
                     {
-                        var json = await e.Response.TextAsync();
-                        Console.WriteLine($"ТОКЕН ПОЛУЧЕН! {json}");
-
-                        using var doc = JsonDocument.Parse(json);
-                        if (doc.RootElement.TryGetProperty("token", out var tokenElement))
-                        {
-                            tcs.TrySetResult(tokenElement.GetString());
-                        }
-                        else
-                        {
-                            tcs.TrySetResult(json.Trim('"'));
-                        }
-                    }
-                    else if (status == System.Net.HttpStatusCode.Unauthorized)
-                    {
-                        var errorText = await e.Response.TextAsync();
-                        Console.WriteLine($"Ошибка 401: {errorText}");
-                        debugLog.Add($"Ошибка 401: {errorText}");
-                    }
-                }
-                else if (url.Contains("/export9.out") || url.Contains(".out"))
-                {
-                    // Это сам файл с котировками
-                    Console.WriteLine($"НАЙДЕН ФАЙЛ: {url}");
-                    debugLog.Add($"НАЙДЕН ФАЙЛ: {url}");
-
-                    // Если нашли файл, значит токен был в URL
-                    var match = System.Text.RegularExpressions.Regex.Match(url, @"finam_token=([^&]+)");
-                    if (match.Success)
-                    {
-                        var tokenFromUrl = match.Groups[1].Value;
-                        Console.WriteLine($"Токен из URL: {tokenFromUrl}");
-                        tcs.TrySetResult(tokenFromUrl);
+                        var popupName = $"popup-{Interlocked.Increment(ref popupCounter)}";
+                        AttachNetworkTracing(popup, popupName);
                     }
                 }
             }
-            catch (Exception ex)
+            catch
             {
-                Console.WriteLine($"Ошибка при обработке ответа: {ex.Message}");
+                // ignore popup attach errors
             }
         };
 
-        page.Request += (sender, e) =>
+        var symbol = parameters.Symbol.ToLowerInvariant();
+        var exportUrl = $"https://www.finam.ru/quote/moex/{symbol}/export/";
+
+        Console.WriteLine($"Переходим: {exportUrl}");
+        try
         {
-            if (e.Request.Url.Contains("/sessions/token") || e.Request.Url.Contains(".out"))
+            await page.GoToAsync(exportUrl, new NavigationOptions
             {
-                Console.WriteLine($"Запрос: {e.Request.Method} {e.Request.Url}");
-            }
-        };
-
-        // Переходим на страницу
-        Console.WriteLine("Переходим на страницу экспорта...");
-
-        try
-        {
-            await page.GoToAsync($"https://www.finam.ru/quote/moex/{parameters.Symbol.ToLower()}/export/",
-                WaitUntilNavigation.Networkidle0);
-            Console.WriteLine("Страница загружена");
+                WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
+                Timeout = 60000
+            });
         }
-        catch (Exception ex)
+        catch (NavigationException ex) when (ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+                                            && page.Url.Contains("finam.ru/quote/moex", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine($"Ошибка навигации: {ex.Message}");
+            // На странице много аналитических трекеров, из-за которых NetworkIdle/жёсткий таймаут часто срабатывает ложноположительно.
+            // Если уже на нужном URL, продолжаем работу.
+            var navWarning = $"Навигация завершилась по таймауту, но целевая страница открыта: {page.Url}";
+            Console.WriteLine(navWarning);
+            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] {navWarning}");
         }
 
-        await page.WaitForFunctionAsync(@"() => document.readyState === 'complete'");
-        await Task.Delay(3000);
+        await page.WaitForSelectorAsync("body");
 
-        // Принимаем куки
-        Console.WriteLine("Принимаем куки...");
-        try
+        await AcceptCookiesAsync(page, debugLog);
+        var formFilled = await FillFormAsync(page, parameters, debugLog);
+        if (!formFilled)
         {
-            await page.WaitForFunctionAsync(@"() => {
-                const buttons = Array.from(document.querySelectorAll('button, div[role=""button""]'));
-                const acceptButton = buttons.find(b => 
-                    (b.textContent || '').toLowerCase().includes('принять'));
-                if (acceptButton) {
-                    acceptButton.click();
-                    return true;
-                }
-                return false;
-            }", new WaitForFunctionOptions { Timeout = 10000 });
-
-            Console.WriteLine("Куки приняты");
-            await Task.Delay(2000);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Кнопка принятия кук не найдена: {ex.Message}");
+            Console.WriteLine("ВНИМАНИЕ: Не удалось уверенно заполнить поля формы автоматически.");
         }
 
-        // Сохраняем состояние до заполнения
-        await page.ScreenshotAsync("finam-before-submit.png");
+        await page.ScreenshotAsync("finam-before-download-click.png");
+        Console.WriteLine("Нажимаем кнопку 'Получить файл'...");
 
-        // Заполняем форму
-        Console.WriteLine("Заполняем форму...");
+        var clicked = await page.EvaluateFunctionAsync<bool>(@"() => {
+            const buttons = Array.from(document.querySelectorAll('button, input[type=""submit""], a'));
+            const submit = buttons.find(b => {
+                const t = (b.textContent || b.value || '').trim().toLowerCase();
+                return t.includes('получить файл') || t === 'получить';
+            });
+            if (!submit) return false;
+            submit.click();
+            return true;
+        }");
 
-        string timeframeValue = GetTimeframeValue(parameters.Timeframe);
-        string fromDateIso = parameters.From.ToString("yyyy-MM-dd");
-        string toDateIso = parameters.To.ToString("yyyy-MM-dd");
+        if (!clicked)
+        {
+            throw new InvalidOperationException("Не удалось найти кнопку 'Получить файл'.");
+        }
 
-        Console.WriteLine($"Параметры:");
-        Console.WriteLine($"  Символ: {parameters.Symbol}");
-        Console.WriteLine($"  От: {fromDateIso}");
-        Console.WriteLine($"  До: {toDateIso}");
-        Console.WriteLine($"  Таймфрейм: {parameters.Timeframe} (value={timeframeValue})");
-
-        // Ждем появления формы
-        await page.WaitForFunctionAsync(@"() => {
-            return document.querySelector('input[name=""from""]') !== null;
-        }", new WaitForFunctionOptions { Timeout = 30000 });
-
-        // Заполняем и отправляем
-        await page.EvaluateFunctionAsync($@"
-            (from, to, tfValue) => {{
-                // Заполняем даты
-                const fromInput = document.querySelector('input[name=""from""]');
-                const toInput = document.querySelector('input[name=""to""]');
-                
-                if (fromInput) {{
-                    fromInput.value = from;
-                    fromInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    fromInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                }}
-                
-                if (toInput) {{
-                    toInput.value = to;
-                    toInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    toInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                }}
-                
-                // Выбираем таймфрейм
-                const select = document.querySelector('select[name=""p""]');
-                if (select) {{
-                    select.value = tfValue;
-                    select.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    console.log('Таймфрейм установлен: ' + tfValue);
-                }}
-                
-                // Ищем кнопку отправки
-                const buttons = Array.from(document.querySelectorAll('button, input[type=""submit""]'));
-                const submitButton = buttons.find(b => {{
-                    const text = (b.textContent || b.value || '').toLowerCase();
-                    return text.includes('получить') || b.type === 'submit';
-                }});
-                
-                if (submitButton) {{
-                    console.log('Нажимаем кнопку:', submitButton.textContent || submitButton.value);
-                    
-                    // Пробуем разные способы клика
-                    submitButton.click();
-                    
-                    // Если кнопка не сработала, пробуем через событие
-                    setTimeout(() => {{
-                        const event = new MouseEvent('click', {{
-                            view: window,
-                            bubbles: true,
-                            cancelable: true
-                        }});
-                        submitButton.dispatchEvent(event);
-                    }}, 100);
-                }}
-            }}", fromDateIso, toDateIso, timeframeValue);
-
-        Console.WriteLine("Форма заполнена, попытка клика выполнена");
-        await page.ScreenshotAsync("finam-after-submit.png");
-
-        // Ждем появления загрузки файла или токена
-        Console.WriteLine("Ожидаем токен или файл (120 секунд)...");
+        await page.ScreenshotAsync("finam-after-download-click.png");
 
         try
         {
             var token = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(120));
-            Console.WriteLine($"Токен успешно получен: {token}");
-
             await File.WriteAllTextAsync("token.txt", token);
             await File.WriteAllLinesAsync("debug.log", debugLog);
 
-            await browser.CloseAsync();
+            Console.WriteLine("Токен получен и сохранён в token.txt");
             return token;
         }
         catch (TimeoutException)
         {
-            Console.WriteLine("Таймаут - токен не получен за 120 секунд");
-
-            var html = await page.GetContentAsync();
-            await File.WriteAllTextAsync("page.html", html);
-            await page.ScreenshotAsync("finam-timeout.png");
+            Console.WriteLine("Таймаут ожидания токена (120 сек). Сохраняем диагностику...");
             await File.WriteAllLinesAsync("debug.log", debugLog);
+            await File.WriteAllTextAsync("page.html", await page.GetContentAsync());
+            await page.ScreenshotAsync("finam-timeout.png");
 
-            // Пробуем найти токен в HTML
-            var tokenMatch = System.Text.RegularExpressions.Regex.Match(html, @"finam_token=([^""&\s]+)");
-            if (tokenMatch.Success)
+            if (sessionTokenUnauthorized)
             {
-                Console.WriteLine($"Найден токен в HTML: {tokenMatch.Groups[1].Value}");
-                return tokenMatch.Groups[1].Value;
+                throw new InvalidOperationException(
+                    "Не удалось получить токен: Finam отвечает 401 на /sessions/token. " +
+                    "Откройте браузер, авторизуйтесь на finam.ru (в том же профиле Chromium), затем повторите запуск.");
             }
 
             throw;
         }
+
+        throw new InvalidOperationException("Неожиданное состояние: метод завершился без токена и без ошибки.");
     }
 
-    private string GetTimeframeValue(TimeFrame tf)
+    private static async Task AcceptCookiesAsync(IPage page, List<string> debugLog)
+    {
+        try
+        {
+            var accepted = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const controls = Array.from(document.querySelectorAll('button, div[role=""button""], a'));
+                const accept = controls.find(c => {
+                    const text = (c.textContent || '').toLowerCase();
+                    return text.includes('принять') || text.includes('соглас');
+                });
+                if (!accept) return false;
+                accept.click();
+                return true;
+            }");
+
+            if (accepted)
+            {
+                debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie banner accepted");
+                await Task.Delay(1000);
+            }
+        }
+        catch (Exception ex)
+        {
+            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Cookie accept skipped: {ex.Message}");
+        }
+    }
+
+    private static async Task<bool> FillFormAsync(IPage page, DownloadParams parameters, List<string> debugLog)
+    {
+        var fromDate = parameters.From.ToString("dd.MM.yyyy");
+        var toDate = parameters.To.ToString("dd.MM.yyyy");
+        var timeframeValue = GetTimeframeValue(parameters.Timeframe);
+
+        await page.WaitForSelectorAsync("input");
+
+        var formFilled = await page.EvaluateFunctionAsync<bool>(@"(fromDate, toDate, timeframeValue) => {
+            const allInputs = Array.from(document.querySelectorAll('input'));
+            const allSelects = Array.from(document.querySelectorAll('select'));
+
+            const fromInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                const p = (i.placeholder || '').toLowerCase();
+                return n === 'from' || p.includes('дд.мм.гггг');
+            });
+
+            const toInput = allInputs.find(i => {
+                const n = (i.name || '').toLowerCase();
+                return n === 'to';
+            }) || allInputs.filter(i => (i.placeholder || '').toLowerCase().includes('дд.мм.гггг'))[1];
+
+            const periodSelect = allSelects.find(s => (s.name || '').toLowerCase() === 'p');
+
+            const writeValue = (el, value) => {
+                if (!el) return;
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            };
+
+            writeValue(fromInput, fromDate);
+            writeValue(toInput, toDate);
+
+            if (periodSelect) {
+                periodSelect.value = timeframeValue;
+                periodSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
+            return !!fromInput || !!toInput || !!periodSelect;
+        }", fromDate, toDate, timeframeValue);
+
+        debugLog.Add($"[{DateTime.Now:HH:mm:ss}] Form fill result = {formFilled}. from={fromDate} to={toDate} tf={parameters.Timeframe}({timeframeValue})");
+
+        return formFilled;
+    }
+
+    private static string GetTimeframeValue(TimeFrame tf)
     {
         return tf switch
         {
