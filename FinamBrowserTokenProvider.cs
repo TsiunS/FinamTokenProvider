@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 
 public class FinamBrowserTokenProvider
@@ -128,8 +127,6 @@ public class FinamBrowserTokenProvider
 
         AttachNetworkTracing(page, "main");
 
-        var popupCounter = 0;
-
         browser.TargetCreated += async (_, e) =>
         {
             try
@@ -139,8 +136,7 @@ public class FinamBrowserTokenProvider
                     var popup = await e.Target.PageAsync();
                     if (popup != null)
                     {
-                        var popupName = $"popup-{Interlocked.Increment(ref popupCounter)}";
-                        AttachNetworkTracing(popup, popupName);
+                        AttachNetworkTracing(popup, $"popup-{e.Target.TargetId}");
                     }
                 }
             }
@@ -154,25 +150,8 @@ public class FinamBrowserTokenProvider
         var exportUrl = $"https://www.finam.ru/quote/moex/{symbol}/export/";
 
         Console.WriteLine($"Переходим: {exportUrl}");
-        try
-        {
-            await page.GoToAsync(exportUrl, new NavigationOptions
-            {
-                WaitUntil = new[] { WaitUntilNavigation.DOMContentLoaded },
-                Timeout = 60000
-            });
-        }
-        catch (NavigationException ex) when (ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
-                                            && page.Url.Contains("finam.ru/quote/moex", StringComparison.OrdinalIgnoreCase))
-        {
-            // На странице много аналитических трекеров, из-за которых NetworkIdle/жёсткий таймаут часто срабатывает ложноположительно.
-            // Если уже на нужном URL, продолжаем работу.
-            var navWarning = $"Навигация завершилась по таймауту, но целевая страница открыта: {page.Url}";
-            Console.WriteLine(navWarning);
-            debugLog.Add($"[{DateTime.Now:HH:mm:ss}] {navWarning}");
-        }
-
-        await page.WaitForSelectorAsync("body");
+        await page.GoToAsync(exportUrl, WaitUntilNavigation.Networkidle0);
+        await page.WaitForFunctionAsync("() => document.readyState === 'complete'");
 
         await AcceptCookiesAsync(page, debugLog);
         await FillFormAsync(page, parameters, debugLog);
